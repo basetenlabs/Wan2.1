@@ -9,6 +9,7 @@ import types
 from contextlib import contextmanager
 from functools import partial
 
+import time
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
@@ -230,7 +231,27 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
+            enable_profile = int(os.getenv("ENABLE_PROFILE", "0"))
+            profiler = None
+            if enable_profile == 1:
+                logging.info("Profiling WanT2V generate")
+                profiler = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    schedule=torch.profiler.schedule(
+                        wait=4,
+                        warmup=1,
+                        active=1,
+                        repeat=1,
+                    ),
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
+                profiler.start()
+
             for _, t in enumerate(tqdm(timesteps)):
+                if profiler is not None:
+                    profiler.step()
                 latent_model_input = latents
                 timestep = [t]
 
@@ -267,5 +288,13 @@ class WanT2V:
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
+
+        if profiler is not None:
+            s = time.perf_counter()
+            profiler.stop()
+            trace_name = os.getenv("TRACE_NAME", "wan_t2v_generate")
+            rank = dist.get_rank() if dist.is_initialized() else self.rank
+            profiler.export_chrome_trace(f"{trace_name}_rank{rank}_pid{os.getpid()}.json.gz")
+            print(f"[{rank}]time taken to dump torch profiler: {time.perf_counter() - s}s")
 
         return videos[0] if self.rank == 0 else None

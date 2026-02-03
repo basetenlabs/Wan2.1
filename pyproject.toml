@@ -35,6 +35,7 @@ dependencies = [
     "flashinfer-python",
     "triton",
     "pytest",
+    "einops",
     "gradio>=5.0.0",
     "xfuser>=0.4.1",
     "sentencepiece>=0.2.1",

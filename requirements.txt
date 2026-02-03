@@ -21,4 +21,5 @@ cuda-python
 flashinfer-python
 triton
 pytest
+einops
 numpy>=1.23.5,<2

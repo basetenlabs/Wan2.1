@@ -14,6 +14,10 @@ try:
     from ..kernels.wan_layer_norm import B10LayerNorm
 except Exception:
     B10LayerNorm = None
+try:
+    from ..kernels.wan_rms_norm import B10RMSNorm
+except Exception:
+    B10RMSNorm = None
 
 __all__ = ['WanModel']
 
@@ -130,8 +134,16 @@ class WanSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        if qk_norm:
+            if enable_b10_kernel() and B10RMSNorm is not None:
+                self.norm_q = B10RMSNorm(dim, eps=eps)
+                self.norm_k = B10RMSNorm(dim, eps=eps)
+            else:
+                self.norm_q = WanRMSNorm(dim, eps=eps)
+                self.norm_k = WanRMSNorm(dim, eps=eps)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""

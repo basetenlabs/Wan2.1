@@ -34,6 +34,14 @@ from .text2video import (
     retrieve_timesteps,
     shard_model,
 )
+try:
+    from .modules.vae2_1 import Wan2_1_VAE
+    _WAN21_VAE_AVAILABLE = True
+except Exception as exc:
+    Wan2_1_VAE = None
+    _WAN21_VAE_AVAILABLE = False
+    logging.warning("Wan2_1_VAE unavailable; falling back to WanVAE. Error: %s",
+                    exc)
 from .utils.vace_processor import VaceVideoProcessor
 from .b10_model_loader import B10ModelLoader, Rank0First
 from .b10_config import enable_b10_attn_cache, enable_b10_kernel
@@ -155,9 +163,14 @@ class WanVace(WanT2V):
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         start_event("create_vae")
-        self.vae = WanVAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+        if enable_b10_kernel() and _WAN21_VAE_AVAILABLE:
+            self.vae = Wan2_1_VAE(
+                vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                device=self.device)
+        else:
+            self.vae = WanVAE(
+                vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                device=self.device)
         end_event("create_vae")
 
         logging.info(f"Creating VaceWanModel from {checkpoint_dir}")
@@ -769,10 +782,16 @@ class WanVaceMP(WanVace):
             text_encoder.model.to(gpu)
             vae_stride = self.config.vae_stride
             patch_size = self.config.patch_size
-            vae = WanVAE(
-                vae_pth=os.path.join(self.checkpoint_dir,
-                                     self.config.vae_checkpoint),
-                device=gpu)
+            if enable_b10_kernel() and _WAN21_VAE_AVAILABLE:
+                vae = Wan2_1_VAE(
+                    vae_pth=os.path.join(self.checkpoint_dir,
+                                         self.config.vae_checkpoint),
+                    device=gpu)
+            else:
+                vae = WanVAE(
+                    vae_pth=os.path.join(self.checkpoint_dir,
+                                         self.config.vae_checkpoint),
+                    device=gpu)
             logging.info(f"Creating VaceWanModel from {self.checkpoint_dir}")
             model = VaceWanModel.from_pretrained(self.checkpoint_dir)
             model.eval().requires_grad_(False)

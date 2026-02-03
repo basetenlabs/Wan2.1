@@ -22,6 +22,14 @@ from .distributed.fsdp import shard_model
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
+try:
+    from .modules.vae2_1 import Wan2_1_VAE
+    _WAN21_VAE_AVAILABLE = True
+except Exception as exc:
+    Wan2_1_VAE = None
+    _WAN21_VAE_AVAILABLE = False
+    logging.warning("Wan2_1_VAE unavailable; falling back to WanVAE. Error: %s",
+                    exc)
 from .b10_model_loader import B10ModelLoader, Rank0First
 from .b10_config import enable_b10_attn_cache, enable_b10_kernel
 from .distributed.b10_attn_cache import B10UNCONDCACHE, B10CONDNCACHE
@@ -149,9 +157,14 @@ class WanT2V:
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         start_event("create_vae")
-        self.vae = WanVAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+        if enable_b10_kernel() and _WAN21_VAE_AVAILABLE:
+            self.vae = Wan2_1_VAE(
+                vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                device=self.device)
+        else:
+            self.vae = WanVAE(
+                vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+                device=self.device)
         end_event("create_vae")
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
@@ -186,19 +199,26 @@ class WanT2V:
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
 
+            use_b10_sp = False
             if enable_b10_kernel():
-                from .distributed.b10_sequence_parallel import (
-                    b10_sp_attn_forward,
-                    b10_sp_block_forward_2_batch,
-                    b10_sp_dit_forward_2_batch,
-                )
-            else:
+                try:
+                    from .distributed.b10_sequence_parallel import (
+                        b10_sp_attn_forward,
+                        b10_sp_block_forward_2_batch,
+                        b10_sp_dit_forward_2_batch,
+                    )
+                    use_b10_sp = True
+                except Exception as exc:
+                    logging.warning(
+                        "B10 sequence-parallel disabled; falling back to USP. "
+                        "Error: %s", exc)
+            if not use_b10_sp:
                 from .distributed.xdit_context_parallel import (
                     usp_attn_forward,
                     usp_dit_forward,
                 )
             for block in self.model.blocks:
-                if enable_b10_kernel():
+                if use_b10_sp:
                     block.forward = types.MethodType(
                         b10_sp_block_forward_2_batch, block)
                     block.self_attn.forward = types.MethodType(
@@ -206,7 +226,7 @@ class WanT2V:
                 else:
                     block.self_attn.forward = types.MethodType(
                         usp_attn_forward, block.self_attn)
-            if enable_b10_kernel():
+            if use_b10_sp:
                 self.model.forward = types.MethodType(
                     b10_sp_dit_forward_2_batch, self.model)
                 self.sp_size = dist.get_world_size(
@@ -216,8 +236,10 @@ class WanT2V:
                 self.model.forward = types.MethodType(usp_dit_forward,
                                                       self.model)
                 self.sp_size = get_sequence_parallel_world_size()
+            self.use_b10_sp = use_b10_sp
         else:
             self.sp_size = 1
+            self.use_b10_sp = False
 
         if dist.is_initialized():
             dist.barrier()
@@ -349,7 +371,7 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
             use_cfg_cache = enable_b10_attn_cache()
-            use_b10_sp = enable_b10_kernel() and self.sp_size > 1
+            use_b10_sp = self.use_b10_sp and self.sp_size > 1
             if use_cfg_cache:
                 B10UNCONDCACHE.step_id_threshold = 10
                 B10UNCONDCACHE.interval = 4
@@ -395,7 +417,7 @@ class WanT2V:
                 else:
                     use_uncond_cache = False
                 self.model.to(self.device)
-                if enable_b10_kernel() and self.sp_size > 1:
+                if use_b10_sp:
                     latent_model_input = latents
                     timestep = torch.stack([t])
                     noise_pred_cond, noise_pred_uncond = self.model(

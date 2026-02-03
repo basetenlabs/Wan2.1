@@ -21,6 +21,7 @@ __all__ = [
 ]
 
 
+@torch.profiler.record_function("flash_attention")
 def flash_attention(
     q,
     k,

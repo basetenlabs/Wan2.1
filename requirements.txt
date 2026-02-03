@@ -16,4 +16,7 @@ gradio>=5.0.0
 rich
 runai_model_streamer
 safetensors
+nvidia-cutlass-dsl==4.1.0
+cuda-python
+flashinfer-python
 numpy>=1.23.5,<2

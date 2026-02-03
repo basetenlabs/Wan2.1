@@ -9,6 +9,8 @@ from xfuser.core.distributed import (
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 from ..modules.model import sinusoidal_embedding_1d
+from ..b10_config import enable_b10_attn_cache
+from .b10_attn_cache import B10CONDNCACHE
 
 
 def pad_freqs(original_tensor, target_len):
@@ -77,6 +79,7 @@ def usp_dit_forward_vace(self, x, vace_context, seq_len, kwargs):
     # arguments
     new_kwargs = dict(x=x)
     new_kwargs.update(kwargs)
+    use_attn_cache = kwargs.get("use_attn_cache", True)
 
     # Context Parallel
     c = torch.chunk(
@@ -84,7 +87,9 @@ def usp_dit_forward_vace(self, x, vace_context, seq_len, kwargs):
         dim=1)[get_sequence_parallel_rank()]
 
     hints = []
-    for block in self.vace_blocks:
+    for block_id, block in enumerate(self.vace_blocks):
+        if use_attn_cache and enable_b10_attn_cache():
+            B10CONDNCACHE.current_layer_id = ("vace", block_id)
         c, c_skip = block(c, **new_kwargs)
         hints.append(c_skip)
     return hints
@@ -100,6 +105,7 @@ def usp_dit_forward(
     vace_context_scale=1.0,
     clip_fea=None,
     y=None,
+    use_attn_cache=True,
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
@@ -154,7 +160,8 @@ def usp_dit_forward(
         grid_sizes=grid_sizes,
         freqs=self.freqs,
         context=context,
-        context_lens=context_lens)
+        context_lens=context_lens,
+        use_attn_cache=use_attn_cache)
 
     # Context Parallel
     x = torch.chunk(
@@ -166,7 +173,9 @@ def usp_dit_forward(
         kwargs['hints'] = hints
         kwargs['context_scale'] = vace_context_scale
 
-    for block in self.blocks:
+    for block_id, block in enumerate(self.blocks):
+        if use_attn_cache and enable_b10_attn_cache():
+            B10CONDNCACHE.current_layer_id = ("base", block_id)
         x = block(x, **kwargs)
 
     # head

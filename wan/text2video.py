@@ -23,6 +23,8 @@ from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
 from .b10_model_loader import B10ModelLoader, Rank0First
+from .b10_config import enable_b10_attn_cache
+from .distributed.b10_attn_cache import B10UNCONDCACHE, B10CONDNCACHE
 from accelerate import init_empty_weights
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
@@ -325,6 +327,17 @@ class WanT2V:
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
+            use_cfg_cache = enable_b10_attn_cache()
+            if use_cfg_cache:
+                B10UNCONDCACHE.step_id_threshold = 10
+                B10UNCONDCACHE.interval = 4
+                B10CONDNCACHE.step_id_threshold = 10
+                B10CONDNCACHE.interval = 3
+                B10CONDNCACHE.max_step_id = len(timesteps)
+                B10UNCONDCACHE.max_step_id = len(timesteps)
+                B10CONDNCACHE.layer_id2attn_output = {}
+                B10UNCONDCACHE.delta_high_freq = None
+                B10UNCONDCACHE.delta_low_freq = None
 
             enable_profile = int(os.getenv("ENABLE_PROFILE", "0"))
             profiler = None
@@ -345,19 +358,59 @@ class WanT2V:
                 profiler.start()
 
             start_event("diffusion_sampling")
-            for _, t in enumerate(tqdm(timesteps)):
+            for step_id, t in enumerate(tqdm(timesteps)):
                 if profiler is not None:
                     profiler.step()
-                latent_model_input = latents
-                timestep = [t]
-
-                timestep = torch.stack(timestep)
-
+                if use_cfg_cache:
+                    B10CONDNCACHE.force_update = False
+                    B10UNCONDCACHE.force_update = False
+                    B10CONDNCACHE.current_step_id = step_id
+                    B10CONDNCACHE.current_ts = t
+                    B10UNCONDCACHE.current_step_id = step_id
+                    use_uncond_cache = B10UNCONDCACHE.if_use_cache_this_step()
+                else:
+                    use_uncond_cache = False
                 self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                if use_cfg_cache:
+                    latent_model_input = latents
+                    timestep = torch.stack([t])
+                    noise_pred_cond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        **arg_c,
+                        use_attn_cache=True,
+                    )[0]
+                    if use_uncond_cache:
+                        noise_pred_uncond = B10UNCONDCACHE.get_cached_output(
+                            noise_pred_cond)
+                    else:
+                        noise_pred_uncond = self.model(
+                            latent_model_input,
+                            t=timestep,
+                            **arg_null,
+                            use_attn_cache=False,
+                        )[0]
+                        if B10UNCONDCACHE.if_use_cache_next_step():
+                            B10UNCONDCACHE.set_cached_output(
+                                noise_pred_cond, noise_pred_uncond)
+                elif self.sp_size > 1:
+                    # Dual-branch CFG in one forward (cond + uncond)
+                    latent_model_input = [latents[0], latents[0]]
+                    timestep = torch.stack([t, t])
+                    context_batched = [context[0], context_null[0]]
+                    preds = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        context=context_batched,
+                        seq_len=seq_len)
+                    noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
+                else:
+                    latent_model_input = latents
+                    timestep = torch.stack([t])
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)

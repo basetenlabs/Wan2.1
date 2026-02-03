@@ -8,6 +8,8 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
+from ..b10_config import enable_b10_attn_cache
+from ..distributed.b10_attn_cache import B10CONDNCACHE
 
 __all__ = ['WanModel']
 
@@ -284,6 +286,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        use_attn_cache=True,
     ):
         r"""
         Args:
@@ -299,11 +302,23 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e[2]
+        use_cache = False
+        if (use_attn_cache and enable_b10_attn_cache()
+                and B10CONDNCACHE.current_step_id is not None
+                and B10CONDNCACHE.current_layer_id is not None):
+            use_cache = B10CONDNCACHE.if_use_cache_this_step()
+        if use_cache:
+            x = B10CONDNCACHE.get_cached_output()
+        else:
+            y = self.self_attn(
+                self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
+                freqs)
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * e[2]
+            if (use_attn_cache and enable_b10_attn_cache()
+                    and B10CONDNCACHE.current_step_id is not None
+                    and B10CONDNCACHE.current_layer_id is not None):
+                B10CONDNCACHE.set_cached_output(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
@@ -498,6 +513,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        use_attn_cache=True,
     ):
         r"""
         Forward pass through the diffusion model
@@ -515,6 +531,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            use_attn_cache (`bool`, *optional*):
+                Whether to enable CFG attention cache logic for this forward pass.
 
         Returns:
             List[Tensor]:
@@ -569,9 +587,12 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            use_attn_cache=use_attn_cache)
 
-        for block in self.blocks:
+        for block_id, block in enumerate(self.blocks):
+            if use_attn_cache and enable_b10_attn_cache():
+                B10CONDNCACHE.current_layer_id = block_id
             x = block(x, **kwargs)
 
         # head

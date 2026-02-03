@@ -4,6 +4,8 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
 
+from ..b10_config import enable_b10_attn_cache
+from ..distributed.b10_attn_cache import B10CONDNCACHE
 from .model import WanAttentionBlock, WanModel, sinusoidal_embedding_1d
 
 
@@ -133,7 +135,12 @@ class VaceWanModel(WanModel):
             kernel_size=self.patch_size,
             stride=self.patch_size)
 
-    def forward_vace(self, x, vace_context, seq_len, kwargs):
+    def forward_vace(self,
+                     x,
+                     vace_context,
+                     seq_len,
+                     kwargs,
+                     use_attn_cache=True):
         # embeddings
         c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
         c = [u.flatten(2).transpose(1, 2) for u in c]
@@ -145,9 +152,12 @@ class VaceWanModel(WanModel):
         # arguments
         new_kwargs = dict(x=x)
         new_kwargs.update(kwargs)
+        new_kwargs['use_attn_cache'] = use_attn_cache
 
         hints = []
-        for block in self.vace_blocks:
+        for block_id, block in enumerate(self.vace_blocks):
+            if use_attn_cache and enable_b10_attn_cache():
+                B10CONDNCACHE.current_layer_id = ("vace", block_id)
             c, c_skip = block(c, **new_kwargs)
             hints.append(c_skip)
         return hints
@@ -162,6 +172,7 @@ class VaceWanModel(WanModel):
         vace_context_scale=1.0,
         clip_fea=None,
         y=None,
+        use_attn_cache=True,
     ):
         r"""
         Forward pass through the diffusion model
@@ -233,13 +244,17 @@ class VaceWanModel(WanModel):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            use_attn_cache=use_attn_cache)
 
-        hints = self.forward_vace(x, vace_context, seq_len, kwargs)
+        hints = self.forward_vace(
+            x, vace_context, seq_len, kwargs, use_attn_cache=use_attn_cache)
         kwargs['hints'] = hints
         kwargs['context_scale'] = vace_context_scale
 
-        for block in self.blocks:
+        for block_id, block in enumerate(self.blocks):
+            if use_attn_cache and enable_b10_attn_cache():
+                B10CONDNCACHE.current_layer_id = ("base", block_id)
             x = block(x, **kwargs)
 
         # head

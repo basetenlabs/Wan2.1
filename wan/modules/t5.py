@@ -437,12 +437,15 @@ def _t5(name,
     else:
         model_cls = T5Model
 
+    skip_load = kwargs.pop('skip_load', False)
+
     # init model
     with torch.device(device):
         model = model_cls(**kwargs)
 
     # set device
-    model = model.to(dtype=dtype, device=device)
+    if not skip_load:
+        model = model.to(dtype=dtype, device=device)
 
     # init tokenizer
     if return_tokenizer:
@@ -479,6 +482,7 @@ class T5EncoderModel:
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
+        skip_load=False,
     ):
         self.text_len = text_len
         self.dtype = dtype
@@ -487,18 +491,24 @@ class T5EncoderModel:
         self.tokenizer_path = tokenizer_path
 
         # init model
-        model = umt5_xxl(
-            encoder_only=True,
-            return_tokenizer=False,
-            dtype=dtype,
-            device=device).eval().requires_grad_(False)
-        logging.info(f'loading {checkpoint_path}')
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
-        self.model = model
-        if shard_fn is not None:
-            self.model = shard_fn(self.model, sync_module_states=False)
+        if skip_load:
+            model = umt5_xxl(
+                encoder_only=True,
+                return_tokenizer=False,
+                skip_load=True).eval().requires_grad_(False)
         else:
-            self.model.to(self.device)
+            model = umt5_xxl(
+                encoder_only=True,
+                return_tokenizer=False,
+                dtype=dtype,
+                device=device).eval().requires_grad_(False)
+            logging.info(f'loading {checkpoint_path}')
+            model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+            if shard_fn is not None:
+                model = shard_fn(model, sync_module_states=False)
+            else:
+                model.to(device)
+        self.model = model
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean='whitespace')

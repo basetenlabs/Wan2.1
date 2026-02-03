@@ -16,6 +16,7 @@ import torch.distributed as dist
 from PIL import Image
 
 import wan
+from wan.b10_model_loader import B10ModelLoader
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
@@ -358,6 +359,9 @@ def generate(args):
         args.base_seed = base_seed[0]
     end_event("broadcast_base_seed")
 
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    b10_model_loader = B10ModelLoader(args.ckpt_dir, num_shards=world_size)
+
     if "t2v" in args.task or "t2i" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -395,6 +399,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
+            b10_model_loader=b10_model_loader,
         )
         end_event("create wan_t2v")
 
@@ -461,6 +466,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
+            b10_model_loader=b10_model_loader,
         )
         end_event("create wan_i2v")
 
@@ -528,6 +534,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
+            b10_model_loader=b10_model_loader,
         )
         end_event("create wan_flf2v")
 
@@ -585,6 +592,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
+            b10_model_loader=b10_model_loader,
         )
         end_event("create wan_vace")
 

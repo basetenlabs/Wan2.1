@@ -14,4 +14,6 @@ imageio-ffmpeg
 flash_attn
 gradio>=5.0.0
 rich
+runai_model_streamer
+safetensors
 numpy>=1.23.5,<2

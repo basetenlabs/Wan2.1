@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
+import json
 import logging
 import math
 import os
@@ -10,6 +11,8 @@ import traceback
 import types
 from contextlib import contextmanager
 from functools import partial
+from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.cuda.amp as amp
@@ -32,6 +35,8 @@ from .text2video import (
     shard_model,
 )
 from .utils.vace_processor import VaceVideoProcessor
+from .b10_model_loader import B10ModelLoader, Rank0First
+from accelerate import init_empty_weights
 try:
     from blite_tracing.trace import start_event, end_event
 except ImportError:
@@ -50,6 +55,7 @@ class WanVace(WanT2V):
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        b10_model_loader: Optional[B10ModelLoader] = None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -81,14 +87,67 @@ class WanVace(WanT2V):
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.b10_model_loader = b10_model_loader or B10ModelLoader(
+            checkpoint_dir, num_shards=world_size)
+
+        text_encoder_meta_path = self.b10_model_loader.b10fs_path(
+            f"text_encoder_shard_info_{world_size}.json")
+        text_encoder_shard_model_path = self.b10_model_loader.b10fs_path(
+            f"text_encoder_shard{rank}-{world_size}.safetensors")
+        delay_text_encoder_load = text_encoder_shard_model_path.exists()
+
+        load_device = "cpu"
+        if dist.is_initialized() and dist.get_backend() == "nccl":
+            load_device = self.device
+
         start_event("create_text_encoder")
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+        if not delay_text_encoder_load:
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir,
+                                             config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir,
+                                            config.t5_tokenizer),
+                shard_fn=None)
+            with Rank0First():
+                text_encoder_metadata = (
+                    self.b10_model_loader.create_or_read_metadata_for_load(
+                        self.text_encoder.model, text_encoder_meta_path))
+            self.b10_model_loader.save_model_shard(
+                self.text_encoder.model,
+                text_encoder_shard_model_path,
+                metadata=text_encoder_metadata,
+                shard_id=rank,
+            )
+        else:
+            with init_empty_weights():
+                self.text_encoder = T5EncoderModel(
+                    text_len=config.text_len,
+                    dtype=config.t5_dtype,
+                    device=torch.device('cpu'),
+                    checkpoint_path=None,
+                    tokenizer_path=os.path.join(checkpoint_dir,
+                                                config.t5_tokenizer),
+                    shard_fn=None,
+                    skip_load=True)
+            with Rank0First():
+                text_encoder_metadata = (
+                    self.b10_model_loader.create_or_read_metadata_for_load(
+                        self.text_encoder.model, text_encoder_meta_path))
+            self.b10_model_loader.load_model_from_safetensors(
+                self.text_encoder.model,
+                text_encoder_shard_model_path,
+                metadata=text_encoder_metadata,
+                shard_id=rank,
+                dtype=config.t5_dtype,
+                device=load_device,
+            )
+        if t5_fsdp:
+            self.text_encoder.model = shard_fn(self.text_encoder.model,
+                                               sync_module_states=False)
         end_event("create_text_encoder")
 
         self.vae_stride = config.vae_stride
@@ -101,7 +160,33 @@ class WanVace(WanT2V):
 
         logging.info(f"Creating VaceWanModel from {checkpoint_dir}")
         start_event("create_model")
-        self.model = VaceWanModel.from_pretrained(checkpoint_dir)
+        model_meta_path = self.b10_model_loader.b10fs_path(
+            f"model_shard_info_{world_size}.json")
+        model_path = Path(checkpoint_dir)
+        if (model_path / "config.json").exists():
+            with init_empty_weights():
+                with open(model_path / "config.json", "r") as f:
+                    model_config = json.load(f)
+                model_config = {
+                    k: v
+                    for k, v in model_config.items()
+                    if not str(k).startswith("_")
+                }
+                self.model = VaceWanModel(**model_config)
+            with Rank0First():
+                model_metadata = (
+                    self.b10_model_loader.create_or_read_metadata_for_load(
+                        self.model, model_meta_path, model_path=model_path))
+            self.b10_model_loader.load_model_from_safetensors(
+                self.model,
+                model_path,
+                metadata=model_metadata,
+                shard_id=rank,
+                dtype=self.param_dtype,
+                device=load_device,
+            )
+        else:
+            self.model = VaceWanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
         end_event("create_model")
 

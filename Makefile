@@ -28,11 +28,11 @@ docker_push:
 
 install_dep:
 	uv sync
+	uv pip install dist/blite_tracing-0.1.0-py3-none-any.whl
 # 	uv pip install dist/flash_attn-2.8.3+cu12torch2.9-cp312-cp312-linux_x86_64.whl
-# 	uv pip install dist/blite_tracing-0.1.0-py3-none-any.whl
 
 run_demo: install_dep
-	ENABLE_PROFILE=1 uv run torchrun --nproc_per_node=4 generate.py \
+	ENABLE_PROFILE=1 BLITE_TRACING_ENABLED=1 uv run torchrun --nproc_per_node=4 generate.py \
 	--task t2v-14B \
 	--size 1280*720 \
 	--ckpt_dir ./Wan2.1-T2V-14B \

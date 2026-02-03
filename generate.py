@@ -3,6 +3,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -18,6 +19,15 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
+try:
+    from rich.logging import RichHandler
+except ImportError:
+    RichHandler = None
+try:
+    from blite_tracing.trace import start_event, end_event, write_trace
+except ImportError:
+    start_event = end_event = lambda x: None
+    write_trace = lambda: None
 
 
 EXAMPLE_PROMPT = {
@@ -252,15 +262,29 @@ def _parse_args():
 
 
 def _init_logging(rank):
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
     # logging
     if rank == 0:
         # set format
+        handlers = [RichHandler()] if RichHandler is not None else [
+            logging.StreamHandler(stream=sys.stdout)
+        ]
         logging.basicConfig(
             level=logging.INFO,
-            format="[%(asctime)s] %(levelname)s: %(message)s",
-            handlers=[logging.StreamHandler(stream=sys.stdout)])
+            format="%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=handlers)
     else:
         logging.basicConfig(level=logging.ERROR)
+
+
+def _append_benchmark_row(task, elapsed_s, path="benchmark_results.csv"):
+    need_header = (not os.path.exists(path)) or os.path.getsize(path) == 0
+    with open(path, "a") as csv_file:
+        if need_header:
+            csv_file.write("task,elapsed_s\n")
+        csv_file.write(f"{task},{elapsed_s}\n")
 
 
 def generate(args):
@@ -274,6 +298,7 @@ def generate(args):
         args.offload_model = False if world_size > 1 else True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
+    start_event("dist init")
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -288,6 +313,7 @@ def generate(args):
         assert not (
             args.ulysses_size > 1 or args.ring_size > 1
         ), f"context parallel are not supported in non-distributed environments."
+    end_event("dist init")
 
     if args.ulysses_size > 1 or args.ring_size > 1:
         assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
@@ -325,10 +351,12 @@ def generate(args):
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")
 
+    start_event("broadcast_base_seed")
     if dist.is_initialized():
         base_seed = [args.base_seed] if rank == 0 else [None]
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
+    end_event("broadcast_base_seed")
 
     if "t2v" in args.task or "t2i" in args.task:
         if args.prompt is None:
@@ -357,6 +385,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
+        start_event("create wan_t2v")
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -367,9 +396,12 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        end_event("create wan_t2v")
 
         logging.info(
             f"Generating {'image' if 't2i' in args.task else 'video'} ...")
+        gen_start_time = time.perf_counter()
+        start_event("generate video")
         video = wan_t2v.generate(
             args.prompt,
             size=SIZE_CONFIGS[args.size],
@@ -380,6 +412,11 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+        end_event("generate video")
+        gen_elapsed = time.perf_counter() - gen_start_time
+        logging.info(f"Generation completed in {gen_elapsed:.2f}s")
+        if rank == 0:
+            _append_benchmark_row(args.task, gen_elapsed)
 
     elif "i2v" in args.task:
         if args.prompt is None:
@@ -414,6 +451,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanI2V pipeline.")
+        start_event("create wan_i2v")
         wan_i2v = wan.WanI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -424,8 +462,11 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        end_event("create wan_i2v")
 
         logging.info("Generating video ...")
+        gen_start_time = time.perf_counter()
+        start_event("generate video")
         video = wan_i2v.generate(
             args.prompt,
             img,
@@ -437,6 +478,11 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+        end_event("generate video")
+        gen_elapsed = time.perf_counter() - gen_start_time
+        logging.info(f"Generation completed in {gen_elapsed:.2f}s")
+        if rank == 0:
+            _append_benchmark_row(args.task, gen_elapsed)
     elif "flf2v" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -472,6 +518,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanFLF2V pipeline.")
+        start_event("create wan_flf2v")
         wan_flf2v = wan.WanFLF2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -482,8 +529,11 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        end_event("create wan_flf2v")
 
         logging.info("Generating video ...")
+        gen_start_time = time.perf_counter()
+        start_event("generate video")
         video = wan_flf2v.generate(
             args.prompt,
             first_frame,
@@ -496,6 +546,11 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+        end_event("generate video")
+        gen_elapsed = time.perf_counter() - gen_start_time
+        logging.info(f"Generation completed in {gen_elapsed:.2f}s")
+        if rank == 0:
+            _append_benchmark_row(args.task, gen_elapsed)
     elif "vace" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -520,6 +575,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating VACE pipeline.")
+        start_event("create wan_vace")
         wan_vace = wan.WanVace(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -530,6 +586,7 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        end_event("create wan_vace")
 
         src_video, src_mask, src_ref_images = wan_vace.prepare_source(
             [args.src_video], [args.src_mask], [
@@ -538,6 +595,8 @@ def generate(args):
             ], args.frame_num, SIZE_CONFIGS[args.size], device)
 
         logging.info(f"Generating video...")
+        gen_start_time = time.perf_counter()
+        start_event("generate video")
         video = wan_vace.generate(
             args.prompt,
             src_video,
@@ -551,10 +610,16 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+        end_event("generate video")
+        gen_elapsed = time.perf_counter() - gen_start_time
+        logging.info(f"Generation completed in {gen_elapsed:.2f}s")
+        if rank == 0:
+            _append_benchmark_row(args.task, gen_elapsed)
     else:
         raise ValueError(f"Unkown task type: {args.task}")
 
     if rank == 0:
+        start_event("save video")
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
@@ -579,7 +644,9 @@ def generate(args):
                 nrow=1,
                 normalize=True,
                 value_range=(-1, 1))
+        end_event("save video")
     logging.info("Finished.")
+    write_trace()
 
 
 if __name__ == "__main__":

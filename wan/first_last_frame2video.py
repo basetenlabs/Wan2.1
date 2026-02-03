@@ -27,6 +27,10 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+try:
+    from blite_tracing.trace import start_event, end_event
+except ImportError:
+    start_event = end_event = lambda x: None
 
 
 class WanFLF2V:
@@ -76,6 +80,7 @@ class WanFLF2V:
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
+        start_event("create_text_encoder")
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -84,12 +89,15 @@ class WanFLF2V:
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None,
         )
+        end_event("create_text_encoder")
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        start_event("create_vae")
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
+        end_event("create_vae")
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
@@ -99,8 +107,10 @@ class WanFLF2V:
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
+        start_event("create_model")
         self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
+        end_event("create_model")
 
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
@@ -241,6 +251,7 @@ class WanFLF2V:
             n_prompt = self.sample_neg_prompt
 
         # preprocess
+        start_event("text_encoder")
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -252,6 +263,7 @@ class WanFLF2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        end_event("text_encoder")
 
         self.clip.model.to(self.device)
         clip_context = self.clip.visual(
@@ -326,6 +338,7 @@ class WanFLF2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
+            start_event("diffusion_sampling")
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
@@ -358,13 +371,18 @@ class WanFLF2V:
 
                 x0 = [latent.to(self.device)]
                 del latent_model_input, timestep
+            end_event("diffusion_sampling")
 
             if offload_model:
+                start_event("offload_model")
                 self.model.cpu()
                 torch.cuda.empty_cache()
+                end_event("offload_model")
 
             if self.rank == 0:
+                start_event("vae_decode")
                 videos = self.vae.decode(x0)
+                end_event("vae_decode")
 
         del noise, latent
         del sample_scheduler

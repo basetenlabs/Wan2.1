@@ -25,6 +25,10 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+try:
+    from blite_tracing.trace import start_event, end_event
+except ImportError:
+    start_event = end_event = lambda x: None
 
 
 class WanT2V:
@@ -70,6 +74,7 @@ class WanT2V:
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
+        start_event("create_text_encoder")
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -77,16 +82,21 @@ class WanT2V:
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None)
+        end_event("create_text_encoder")
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        start_event("create_vae")
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
+        end_event("create_vae")
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
+        start_event("create_model")
         self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
+        end_event("create_model")
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
@@ -172,6 +182,7 @@ class WanT2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
+        start_event("text_encoder")
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -183,6 +194,7 @@ class WanT2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        end_event("text_encoder")
 
         noise = [
             torch.randn(
@@ -249,6 +261,7 @@ class WanT2V:
                 )
                 profiler.start()
 
+            start_event("diffusion_sampling")
             for _, t in enumerate(tqdm(timesteps)):
                 if profiler is not None:
                     profiler.step()
@@ -273,13 +286,18 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+            end_event("diffusion_sampling")
 
             x0 = latents
             if offload_model:
+                start_event("offload_model")
                 self.model.cpu()
                 torch.cuda.empty_cache()
+                end_event("offload_model")
             if self.rank == 0:
+                start_event("vae_decode")
                 videos = self.vae.decode(x0)
+                end_event("vae_decode")
 
         del noise, latents
         del sample_scheduler

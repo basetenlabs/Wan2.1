@@ -8,8 +8,12 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
-from ..b10_config import enable_b10_attn_cache
+from ..b10_config import enable_b10_attn_cache, enable_b10_kernel
 from ..distributed.b10_attn_cache import B10CONDNCACHE
+try:
+    from ..kernels.wan_layer_norm import B10LayerNorm
+except Exception:
+    B10LayerNorm = None
 
 __all__ = ['WanModel']
 
@@ -258,10 +262,13 @@ class WanAttentionBlock(nn.Module):
         self.eps = eps
 
         # layers
-        self.norm1 = WanLayerNorm(dim, eps)
+        norm_cls = (B10LayerNorm if (enable_b10_kernel()
+                                     and B10LayerNorm is not None) else
+                    WanLayerNorm)
+        self.norm1 = norm_cls(dim, eps, elementwise_affine=False)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
                                           eps)
-        self.norm3 = WanLayerNorm(
+        self.norm3 = norm_cls(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
@@ -269,7 +276,7 @@ class WanAttentionBlock(nn.Module):
                                                                       (-1, -1),
                                                                       qk_norm,
                                                                       eps)
-        self.norm2 = WanLayerNorm(dim, eps)
+        self.norm2 = norm_cls(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
             nn.Linear(ffn_dim, dim))
@@ -353,12 +360,18 @@ class Head(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, C]
+            e(Tensor): Shape [B, C] or [B, L1, C]
         """
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-            x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+            if e.dim() == 2:
+                e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+                x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+            else:
+                e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(
+                    2, dim=2)
+                x = (self.head(self.norm(x) * (1 + e[1].squeeze(2)) +
+                               e[0].squeeze(2)))
         return x
 
 

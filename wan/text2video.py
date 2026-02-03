@@ -23,7 +23,7 @@ from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
 from .b10_model_loader import B10ModelLoader, Rank0First
-from .b10_config import enable_b10_attn_cache
+from .b10_config import enable_b10_attn_cache, enable_b10_kernel
 from .distributed.b10_attn_cache import B10UNCONDCACHE, B10CONDNCACHE
 from accelerate import init_empty_weights
 from .utils.fm_solvers import (
@@ -186,15 +186,36 @@ class WanT2V:
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
 
-            from .distributed.xdit_context_parallel import (
-                usp_attn_forward,
-                usp_dit_forward,
-            )
+            if enable_b10_kernel():
+                from .distributed.b10_sequence_parallel import (
+                    b10_sp_attn_forward,
+                    b10_sp_block_forward_2_batch,
+                    b10_sp_dit_forward_2_batch,
+                )
+            else:
+                from .distributed.xdit_context_parallel import (
+                    usp_attn_forward,
+                    usp_dit_forward,
+                )
             for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward, block.self_attn)
-            self.model.forward = types.MethodType(usp_dit_forward, self.model)
-            self.sp_size = get_sequence_parallel_world_size()
+                if enable_b10_kernel():
+                    block.forward = types.MethodType(
+                        b10_sp_block_forward_2_batch, block)
+                    block.self_attn.forward = types.MethodType(
+                        b10_sp_attn_forward, block.self_attn)
+                else:
+                    block.self_attn.forward = types.MethodType(
+                        usp_attn_forward, block.self_attn)
+            if enable_b10_kernel():
+                self.model.forward = types.MethodType(
+                    b10_sp_dit_forward_2_batch, self.model)
+                self.sp_size = dist.get_world_size(
+                ) if dist.is_initialized() else get_sequence_parallel_world_size(
+                )
+            else:
+                self.model.forward = types.MethodType(usp_dit_forward,
+                                                      self.model)
+                self.sp_size = get_sequence_parallel_world_size()
         else:
             self.sp_size = 1
 
@@ -328,6 +349,7 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
             use_cfg_cache = enable_b10_attn_cache()
+            use_b10_sp = enable_b10_kernel() and self.sp_size > 1
             if use_cfg_cache:
                 B10UNCONDCACHE.step_id_threshold = 10
                 B10UNCONDCACHE.interval = 4
@@ -361,17 +383,31 @@ class WanT2V:
             for step_id, t in enumerate(tqdm(timesteps)):
                 if profiler is not None:
                     profiler.step()
-                if use_cfg_cache:
+                if use_cfg_cache or use_b10_sp:
                     B10CONDNCACHE.force_update = False
                     B10UNCONDCACHE.force_update = False
                     B10CONDNCACHE.current_step_id = step_id
                     B10CONDNCACHE.current_ts = t
                     B10UNCONDCACHE.current_step_id = step_id
-                    use_uncond_cache = B10UNCONDCACHE.if_use_cache_this_step()
+                    use_uncond_cache = (
+                        use_cfg_cache
+                        and B10UNCONDCACHE.if_use_cache_this_step())
                 else:
                     use_uncond_cache = False
                 self.model.to(self.device)
-                if use_cfg_cache:
+                if enable_b10_kernel() and self.sp_size > 1:
+                    latent_model_input = latents
+                    timestep = torch.stack([t])
+                    noise_pred_cond, noise_pred_uncond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        context=context,
+                        context_null=context_null,
+                        seq_len=seq_len,
+                    )
+                    noise_pred_cond = noise_pred_cond[0]
+                    noise_pred_uncond = noise_pred_uncond[0]
+                elif use_cfg_cache:
                     latent_model_input = latents
                     timestep = torch.stack([t])
                     noise_pred_cond = self.model(

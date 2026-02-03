@@ -19,4 +19,6 @@ safetensors
 nvidia-cutlass-dsl==4.1.0
 cuda-python
 flashinfer-python
+triton
+pytest
 numpy>=1.23.5,<2

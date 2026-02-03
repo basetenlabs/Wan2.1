@@ -36,7 +36,7 @@ from .text2video import (
 )
 from .utils.vace_processor import VaceVideoProcessor
 from .b10_model_loader import B10ModelLoader, Rank0First
-from .b10_config import enable_b10_attn_cache
+from .b10_config import enable_b10_attn_cache, enable_b10_kernel
 from .distributed.b10_attn_cache import B10UNCONDCACHE, B10CONDNCACHE
 from accelerate import init_empty_weights
 try:
@@ -200,6 +200,10 @@ class WanVace(WanT2V):
                 usp_dit_forward,
                 usp_dit_forward_vace,
             )
+            if enable_b10_kernel():
+                logging.warning(
+                    "ENABLE_B10_KERNEL=1 requested, but VACE does not support "
+                    "b10 sequence-parallel fused path; falling back to USP.")
             for block in self.model.blocks:
                 block.self_attn.forward = types.MethodType(
                     usp_attn_forward, block.self_attn)
@@ -781,6 +785,11 @@ class WanVaceMP(WanVace):
                     usp_dit_forward,
                     usp_dit_forward_vace,
                 )
+                if enable_b10_kernel():
+                    logging.warning(
+                        "ENABLE_B10_KERNEL=1 requested, but VACE does not "
+                        "support b10 sequence-parallel fused path; falling "
+                        "back to USP.")
                 for block in model.blocks:
                     block.self_attn.forward = types.MethodType(
                         usp_attn_forward, block.self_attn)

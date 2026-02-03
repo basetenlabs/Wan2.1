@@ -33,6 +33,8 @@ dependencies = [
     "nvidia-cutlass-dsl==4.1.0",
     "cuda-python",
     "flashinfer-python",
+    "triton",
+    "pytest",
     "gradio>=5.0.0",
     "xfuser>=0.4.1",
     "sentencepiece>=0.2.1",
